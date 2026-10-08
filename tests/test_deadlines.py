@@ -42,6 +42,7 @@ def contract():
                 raise self.send_error
             if self.send_gate:
                 await self.send_gate.wait()
+            await ws.send(json.dumps({"lwp": "/r/MessageSend/sendByReceiverScope", "headers": {"mid": "offline-mid"}}))
 
         async def send_msg_once(self, toid, item_id, send_message):
             # Current upstream contract: init is synchronous internally;
@@ -63,11 +64,11 @@ def contract():
              "TOKEN_TTL", "_http_deadline", "_token_cache", "_token_inflight", "_token_lock",
              "_orig_get_token", "_fetch_token", "_cached_get_token", "_limit_http_session",
              "_orig_client_init", "_client_init", "_orig_live_init", "_orig_send_msg_once",
-             "_ReadyTokenApi", "_LiveView", "_live_init", "_ChatSendFailed", "_ChatAttempt",
+             "_ReadyTokenApi", "_LiveView", "_RegWaitWS", "_live_init", "_ChatSendFailed", "_ChatAttempt",
              "_consume_chat_task", "_send_msg_once"}
     nodes = []
     for node in ast.parse(SOURCE.read_text()).body:
-        if isinstance(node, ast.Import) and all(n.name in {"asyncio", "threading", "time"} for n in node.names):
+        if isinstance(node, ast.Import) and all(n.name in {"asyncio", "json", "threading", "time"} for n in node.names):
             nodes.append(node)
         elif isinstance(node, ast.ImportFrom) and node.module in {"concurrent.futures", "contextvars"}:
             nodes.append(node)
@@ -99,12 +100,25 @@ class FakeSession:
 
 
 class FakeWS:
-    def __init__(self, repeats=0):
+    """Models the real server: /reg must be confirmed before anything else, every message gets a reply by mid."""
+
+    def __init__(self, repeats=0, send_code=200, ack=True):
         self.sent = []
         self.repeats = repeats
+        self.send_code = send_code
+        self.ack = ack
+        self.replies = asyncio.Queue()
 
     async def send(self, text):
-        self.sent.append(json.loads(text))
+        msg = json.loads(text)
+        self.sent.append(msg)
+        if msg.get("lwp") == "/reg":
+            self.replies.put_nowait({"code": 200, "headers": {"reg-uid": "offline"}})
+        elif msg.get("lwp") == "/r/MessageSend/sendByReceiverScope" and self.ack:
+            self.replies.put_nowait({"code": self.send_code, "headers": {"mid": msg["headers"]["mid"]}})
+
+    async def recv(self):
+        return json.dumps(await self.replies.get())
 
     def __aiter__(self):
         return self
@@ -296,6 +310,34 @@ class AsyncDeadlines(unittest.IsolatedAsyncioTestCase):
         obj = live(ns, auth(ns, lambda _: {"data": {"accessToken": "offline"}}), repeats=2)
         self.assertIsNone(await obj.send_msg_once("fake-user", "fake-item", "fake-message"))
         self.assertEqual(obj.send_calls, 1)
+
+    async def test_rejected_send_reply_is_reported_not_success(self):
+        ns = contract()
+        obj = live(ns, auth(ns, lambda _: {"data": {"accessToken": "offline"}}), repeats=2)
+        obj.ws.send_code = 400
+        with self.assertRaisesRegex(RuntimeError, "拒绝"):
+            await obj.send_msg_once("fake-user", "fake-item", "fake-message")
+        self.assertEqual(obj.send_calls, 1)
+
+    async def test_missing_send_reply_is_unknown_not_success(self):
+        ns = contract()
+        obj = live(ns, auth(ns, lambda _: {"data": {"accessToken": "offline"}}), repeats=2)
+        obj.ws.ack = False
+        with self.assertRaisesRegex(RuntimeError, "结果未知"):
+            await obj.send_msg_once("fake-user", "fake-item", "fake-message")
+        self.assertEqual(obj.send_calls, 1)
+
+    async def test_create_waits_for_reg_confirmation(self):
+        ns = contract()
+        obj = live(ns, auth(ns, lambda _: {"data": {"accessToken": "offline"}}), repeats=2)
+        order = []
+        original_create = obj.create_chat
+        async def create(ws, toid, item_id):
+            order.append(("create", obj.ws.replies.qsize()))
+            return await original_create(ws, toid, item_id)
+        obj.create_chat = create
+        await obj.send_msg_once("fake-user", "fake-item", "fake-message")
+        self.assertEqual(order, [("create", 0)])  # reg reply already consumed before create
 
     async def test_send_risk_error_keeps_guardrail_marker_and_cause(self):
         ns = contract()

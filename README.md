@@ -10,7 +10,19 @@ Python 3.12 / POSIX（使用 fcntl），`python -m pip install -r requirements.t
 
 Docker 仅提供 stdio 打包模板：`docker build -t ericmingle-xianyu-mcp .`，`docker run --rm -i --env-file .env -v mcp-xianyu-data:/app/data ericmingle-xianyu-mcp`。已有生产部署未修改，模板尚未在 NAS 进行部署验证。
 
-扩展保留收藏、登录、固定设备身份、风控冷却、HTTP/聊天等待时限等能力。买卖操作均取决于上游工具和账号权限；本轮不进行下单支付、真实商家消息或生产改动。离线合同通过不能替代真实站点验收。
+扩展保留收藏、登录、固定设备身份、风控冷却、HTTP/聊天等待时限等能力。买卖操作均取决于上游工具和账号权限；本仓库不提供下单支付。离线合同通过不能替代真实站点验收。
+
+## 功能与状态（2026-10-08 真实站点验收）
+
+| 功能 | 状态 |
+|---|---|
+| 搜索、商品详情、收藏 | 可用 |
+| 我的资料 `get_my_profile` | 已修：闲鱼导航接口把资料移到 `data.module.base`，扩展层改为从这里取昵称、头像、粉丝/关注/卖出/买入/收藏数，用户 ID 取登录 Cookie 的 `unb`；所在地和卖家等级该接口不提供 |
+| 聊天发送 `send_text_message` | 已修并与真实卖家验证：① 上游注册（`/reg`）未确认就建会话，服务端回 400，拿不到会话 ID 而超时，现在等注册确认（200 + `reg-uid`）再继续；② 上游写出消息就关闭连接，消息会丢，但仍报成功，现在必须收到同 `mid` 的 200 回执才算发送成功，非 200 报错，无回执按"结果未知"报错且不重发 |
+| 会话与聊天记录 | 可用；新建会话默认隐藏，`list_conversations` 需加 `include_hidden=true` 才能看到 |
+| 登录 | 首次扫码由本人完成；之后的登录环境同步属于部署方私有集成，不在本仓库 |
+
+测试 `tests/test_deadlines.py` 的假连接按真实协议建模（注册确认、按 `mid` 回执），覆盖消息被拒、无回执、注册确认前不建会话三种情形。
 
 `python -m unittest discover -s tests -v` 验证离线合同（缺上游依赖会明确跳过集成测试）；`python scripts/scan_public.py .` 检查分发边界。
 

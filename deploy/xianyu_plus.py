@@ -341,11 +341,35 @@ class _LiveView:
         return getattr(self._live, name)
 
 
+class _RegWaitWS:
+    """上游 init 发完 /reg 立刻发 ackDiff，随后马上建会话；服务端在注册确认前收到的请求一律回 400，
+    建会话拿不到 cid，发送就一直等到超时。这里在 /reg 发出后等到注册确认（200 + reg-uid）再继续。"""
+
+    def __init__(self, ws):
+        self._ws = ws
+
+    def __getattr__(self, name):
+        return getattr(self._ws, name)
+
+    async def send(self, message):
+        await self._ws.send(message)
+        if '"/reg"' not in message:
+            return
+        async def wait_reg():
+            while True:
+                reply = json.loads(await self._ws.recv())
+                if reply.get("code") == 200 and "reg-uid" in (reply.get("headers") or {}):
+                    return
+                if isinstance(reply.get("code"), int) and reply["code"] >= 400 and "reg" in str(reply.get("headers")):
+                    raise RuntimeError(f"闲鱼聊天注册被拒绝：{reply.get('code')}")
+        await asyncio.wait_for(wait_reg(), timeout=10)
+
+
 async def _live_init(self, ws):
     token = await asyncio.to_thread(self.xianyu.get_token)
     view = _LiveView(self)
     view.xianyu = _ReadyTokenApi(self.xianyu, token)
-    return await _orig_live_init(view, ws)
+    return await _orig_live_init(view, _RegWaitWS(ws))
 
 
 class _ChatSendFailed(BaseException):
@@ -360,8 +384,29 @@ class _ChatAttempt(_LiveView):
         if self.expired or self.attempted:
             raise _ChatSendFailed("聊天等待已结束，不再发送")
         self.attempted = True
+        ws, rest = args[0], args[1:]
+        sent = []
+
+        class _Capture:
+            def __getattr__(_, name):
+                return getattr(ws, name)
+
+            async def send(_, message):
+                sent.append(json.loads(message))
+                await ws.send(message)
+
         try:
-            return await self._live.send_msg(*args, **kwargs)
+            result = await self._live.send_msg(_Capture(), *rest, **kwargs)
+            if not sent:
+                raise RuntimeError("消息未写出")
+            # 上游写完就返回并关连接，服务端尚未落库时消息会丢；等到同 mid 的 200 回执才算发送成功。
+            mid = sent[-1]["headers"]["mid"]
+            while True:
+                reply = json.loads(await ws.recv())
+                if (reply.get("headers") or {}).get("mid") == mid:
+                    if reply.get("code") != 200:
+                        raise RuntimeError(f"闲鱼拒绝了这条消息：{reply.get('code')}")
+                    return result
         except Exception as exc:
             raise _ChatSendFailed(str(exc)) from exc
 
@@ -688,6 +733,33 @@ def _with_login_hint(tool):
             except Exception as e:
                 raise hinted(e) from e
     tool.fn = wrapper
+
+
+from xianyu_mcp.tools import xianyu_api_tools as _xat  # noqa: E402
+
+_orig_get_my_profile = _xat.XianYuApiTools.get_my_profile
+_NAV_COUNTS = {"followers": "followers", "following": "following", "soldCount": "sold_count",
+               "purchaseCount": "purchase_count", "collectionCount": "collection_count"}
+
+
+def _profile_from_nav(self):
+    """闲鱼导航接口现在把资料放在 data.module.base（displayName/avatar/计数），上游仍按旧字段解析导致全空。"""
+    out = json.loads(_orig_get_my_profile(self))
+    base = (((out.get("raw") or {}).get("data") or {}).get("module") or {}).get("base") or {}
+    profile = out.setdefault("profile", {})
+    if base:
+        profile["nick"] = profile.get("nick") or base.get("displayName")
+        profile["avatar_url"] = profile.get("avatar_url") or base.get("avatar")
+        for src, dst in _NAV_COUNTS.items():
+            if src in base:
+                profile[dst] = base[src]
+    if not profile.get("user_id"):
+        jar = dict(kv.split("=", 1) for kv in up._load_cookie_str().split("; ") if "=" in kv)
+        profile["user_id"] = jar.get("unb") or None
+    return _xat._dump(out)
+
+
+_xat.XianYuApiTools.get_my_profile = _profile_from_nav
 
 
 for _tool in list(mcp._tool_manager._tools.values()):
