@@ -1,0 +1,4 @@
+xianyu-mcp-server==1.0.0
+pyxianyu==1.0.0
+mcp[cli]==1.30.0
+paramiko==4.0.0

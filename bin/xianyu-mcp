@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+TASK_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -z "${MCP_PYTHON:-}" ]; then
+  if [ -x "$TASK_ROOT/.venv/bin/python" ]; then MCP_PYTHON="$TASK_ROOT/.venv/bin/python"; else MCP_PYTHON=python; fi
+fi
+exec "$MCP_PYTHON" "$TASK_ROOT/deploy/xianyu_plus.py" "$@"
